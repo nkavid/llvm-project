@@ -85,8 +85,14 @@ public:
       : Type(Type), Pos(Pos), ChecksGlob(std::make_unique<CachedGlobList>(
                                   Checks.value_or("*"),
                                   /*KeepNegativeGlobs=*/false)) {
-    if (Checks)
+    if (Checks) {
       this->Checks = trimWhitespace(*Checks);
+      SmallVector<StringRef> Split;
+      StringRef(this->Checks.value()).split(Split, ',');
+      for (const auto &elem : Split) {
+        this->UsedChecks.insert({elem, false});
+      }
+    }
   }
 
   // The type - one of NOLINT[NEXTLINE/BEGIN/END].
@@ -99,11 +105,27 @@ public:
   std::optional<std::string> checks() const { return Checks; }
 
   // Whether this NOLINT applies to the provided check.
-  bool suppresses(StringRef Check) const { return ChecksGlob->contains(Check); }
+  bool suppresses(StringRef Check) const {
+    if (ChecksGlob->contains(Check)) {
+      UsedChecks[Check] = true;
+      return true;
+    }
+    return false;
+  }
+
+  SmallVector<StringRef> getUnusedChecks() const {
+    SmallVector<StringRef> result;
+    for (const auto &elem : UsedChecks) {
+      if (!elem.getValue())
+        result.emplace_back(elem.getKey());
+    }
+    return result;
+  }
 
 private:
   std::optional<std::string> Checks;
   std::unique_ptr<CachedGlobList> ChecksGlob;
+  mutable llvm::StringMap<bool> UsedChecks;
 };
 
 } // namespace
@@ -172,6 +194,12 @@ public:
            Begin.suppresses(DiagName);
   }
 
+  SmallVector<StringRef> getUnusedChecks() const {
+    return Begin.getUnusedChecks();
+  }
+
+  std::optional<std::string> checks() const { return Begin.checks(); };
+
 private:
   NoLintToken Begin;
   size_t EndPos;
@@ -222,6 +250,8 @@ public:
                       SmallVectorImpl<tooling::Diagnostic> &NoLintErrors,
                       bool AllowIO, bool EnableNoLintBlocks);
 
+  void warnOnUnusedNoLint() const;
+
 private:
   bool diagHasNoLintInMacro(const Diagnostic &Diag, StringRef DiagName,
                             SmallVectorImpl<tooling::Diagnostic> &NoLintErrors,
@@ -247,6 +277,19 @@ bool NoLintDirectiveHandler::Impl::shouldSuppress(
     return false;
   return diagHasNoLintInMacro(Diag, DiagName, NoLintErrors, AllowIO,
                               EnableNoLintBlocks);
+}
+
+void NoLintDirectiveHandler::Impl::warnOnUnusedNoLint() const {
+  for (const auto &cacheEntry : Cache) {
+    for (const auto &nolintblock : cacheEntry.getValue()) {
+      for (const auto &unused : nolintblock.getUnusedChecks()) {
+        // Create diagnostic messages using srcMgr instead and message
+        // from ClangTidyDiagnosticConsumer or ClangTidyContext
+        llvm::errs() << cacheEntry.getKey() << ": " << "Unused suppression of "
+                     << unused << '\n';
+      }
+    }
+  }
 }
 
 // Look at the macro's spelling location for a NOLINT. If none is found, keep
@@ -400,7 +443,9 @@ void NoLintDirectiveHandler::Impl::generateCache(
 NoLintDirectiveHandler::NoLintDirectiveHandler()
     : PImpl(std::make_unique<Impl>()) {}
 
-NoLintDirectiveHandler::~NoLintDirectiveHandler() = default;
+NoLintDirectiveHandler::~NoLintDirectiveHandler() {
+  PImpl->warnOnUnusedNoLint();
+}
 
 bool NoLintDirectiveHandler::shouldSuppress(
     DiagnosticsEngine::Level DiagLevel, const Diagnostic &Diag,
